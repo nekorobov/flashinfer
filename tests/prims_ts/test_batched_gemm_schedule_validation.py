@@ -19,6 +19,117 @@ import sys
 import pytest
 
 
+def test_persistent_cta_swizzle_config_and_cli_mapping():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        CtaRasterOrder,
+        TileScheduler,
+        make_config,
+        validate_config,
+    )
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+        _parse_overrides,
+        build_arg_parser,
+    )
+
+    parser = build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--tile-scheduler",
+            "persistent",
+            "--cta-swizzle-type",
+            "rasterizeAlongN",
+        ]
+    )
+    overrides = _parse_overrides(args)
+    cfg = make_config(**overrides)
+
+    validate_config(cfg)
+    assert cfg.cta_raster_order == int(CtaRasterOrder.ALONG_N)
+    assert cfg.tile_scheduler == int(TileScheduler.PERSISTENT)
+    assert not cfg.raster_along_m
+
+
+def test_along_n_cta_swizzle_rejects_non_persistent_scheduler():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        CtaRasterOrder,
+        make_config,
+        validate_config,
+    )
+
+    cfg = make_config(cta_raster_order=int(CtaRasterOrder.ALONG_N))
+
+    with pytest.raises(ValueError, match="requires persistent scheduling"):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    (
+        ([], 32),
+        (["--tmem-ldst-max-num-regs", "32"], 32),
+        (["--tmem-ldst-max-num-regs", "64"], 64),
+    ),
+)
+def test_tmem_ldst_max_num_regs_cli_mapping(argv, expected):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+        _parse_overrides,
+        build_arg_parser,
+    )
+
+    args = build_arg_parser().parse_args(argv)
+    cfg = make_config(**_parse_overrides(args))
+
+    assert cfg.tmem_ldst_max_num_regs == expected
+
+
+@pytest.mark.parametrize(
+    ("max_regs", "epi_tile_n", "expected_overlap_loads"),
+    ((32, 64, 2), (64, 64, 1), (64, 128, 2)),
+)
+def test_non_swap_ht256_overlap_uses_epilogue_tile_width(
+    max_regs, epi_tile_n, expected_overlap_loads
+):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        SfLayout,
+        TileScheduler,
+        compute_warp_layout,
+        make_config,
+        validate_config,
+    )
+
+    cfg = make_config(
+        cluster_m=2,
+        tile_m=128,
+        tile_n=256,
+        tile_k=256,
+        epi_tile_m=128,
+        epi_tile_n=epi_tile_n,
+        mma_m=256,
+        mma_n=256,
+        mma_k=64,
+        tile_scheduler=int(TileScheduler.PERSISTENT),
+        num_stages_tmem_acc=1,
+        sf_layout_a=int(SfLayout.R128c4),
+        sf_layout_b=int(SfLayout.R128c4),
+        use_max_tmem_overlap=1,
+        use_tma_store=1,
+        tmem_ldst_max_num_regs=max_regs,
+    )
+    compute_warp_layout(cfg)
+    validate_config(cfg)
+
+    assert cfg.num_epilogue_warps == 4
+    assert cfg.non_swap_tmem_overlap_loads == expected_overlap_loads
+    max_swizzled_cols = 128 * 8 // cfg.dtype_c_bits
+    assert cfg.non_swap_tma_store_cols == min(cfg.epi_tile_n, max_swizzled_cols)
+    assert cfg.epi_tile_n % cfg.non_swap_tma_store_cols == 0
+    tma_store_bytes = (
+        cfg.tile_m * cfg.non_swap_tma_store_cols * cfg.dtype_c_bits // 8
+    )
+    assert cfg.num_bytes_c_per_stage % tma_store_bytes == 0
+
+
 @pytest.mark.timeout(240)
 def test_schedule_checker_reports_no_persistent_c_scratch_ab_alias_race():
     """Persistent multi-stage work IDs keep C scratch separate from A/B.
