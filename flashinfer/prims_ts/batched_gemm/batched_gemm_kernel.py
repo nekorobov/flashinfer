@@ -21,6 +21,7 @@ Entry points:
 """
 
 import os
+from dataclasses import replace
 
 import cutlass
 import cutlass.experimental.cuda as cuda
@@ -1719,7 +1720,71 @@ def _batched_gemm_kernel_bf16_body(
         tmem_dealloc_mbar_alloc = smem_allocator.add(
             SmemAllocation("tmem_dealloc_mbar", dtype=cutlass.Int64, alignment=8)
         )
+
+    # Keep the persistent scheduler's response and software-pipeline barriers
+    # in the unified dynamic-SMEM block.  A standalone ``alloc_smem`` object
+    # makes the CUDA function reserve a separate 1 KiB static-SMEM region,
+    # which unnecessarily reduces the opt-in dynamic-SMEM ceiling.
+    clc_response_alloc = None
+    workid_barrier_alloc = None
+    work_throttle_barrier_alloc = None
+    if cutlass.const_expr(cfg.is_persistent):
+        clc_response_alloc = smem_allocator.add(
+            SmemAllocation(
+                "clc_response",
+                dtype=cutlass.Int128,
+                count=cfg.num_stages_workid,
+                alignment=16,
+            )
+        )
+        workid_barrier_alloc = smem_allocator.add(
+            SmemAllocation(
+                "workid_mbarriers",
+                dtype=cutlass.Int64,
+                count=2 * cfg.num_stages_workid,
+                alignment=8,
+            )
+        )
+        if cutlass.const_expr(cfg.use_work_throttle_barrier):
+            work_throttle_barrier_alloc = smem_allocator.add(
+                SmemAllocation(
+                    "work_throttle_mbarriers",
+                    dtype=cutlass.Int64,
+                    count=2 * cfg.num_stages_workid,
+                    alignment=8,
+                )
+            )
     smem_allocator.compute_layout()
+
+    clc_response_ptr = None
+    if cutlass.const_expr(cfg.is_persistent):
+        # Materialize the unified block now because the CLC scheduler config
+        # needs its response pointer before TaskManager setup. ``allocate()``
+        # is idempotent, so TaskManager will reuse this same block later.
+        smem_allocator.allocate()
+        clc_response_ptr = cute.make_ptr(
+            cutlass.Int128,
+            smem_allocator.smem_base.data_ptr() + clc_response_alloc.offset,
+            mem_space=cutlass.AddressSpace.smem,
+        )
+        workid_barrier_ptr = cute.make_ptr(
+            cutlass.Int64,
+            smem_allocator.smem_base.data_ptr() + workid_barrier_alloc.offset,
+            mem_space=cutlass.AddressSpace.smem,
+        )
+        pcfgs["workid"] = replace(
+            pcfgs["workid"], barrier_ptr=workid_barrier_ptr
+        )
+        if cutlass.const_expr(cfg.use_work_throttle_barrier):
+            work_throttle_barrier_ptr = cute.make_ptr(
+                cutlass.Int64,
+                smem_allocator.smem_base.data_ptr()
+                + work_throttle_barrier_alloc.offset,
+                mem_space=cutlass.AddressSpace.smem,
+            )
+            pcfgs["work_throttle"] = replace(
+                pcfgs["work_throttle"], barrier_ptr=work_throttle_barrier_ptr
+            )
 
     # TMEM allocator
     tmem_allocator = TmemAllocator()
@@ -1748,8 +1813,6 @@ def _batched_gemm_kernel_bf16_body(
             num_non_exiting_ctas_value = num_non_exiting_ctas_view.load(
                 idx=Int32(0), vector_size=1
             )[0]
-        # CLC response buffer in SMEM
-        clc_response_ptr = cute.arch.alloc_smem(cutlass.Int128, cfg.num_stages_workid)
         tile_sched_cfg = (
             TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
                 tile_scheduler_params=tile_sched_params,
